@@ -731,6 +731,8 @@ async def get_usdt_symbols(session: aiohttp.ClientSession) -> List[str]:
                     and s.get("status")       == "TRADING"
                     and s.get("contractType") == "PERPETUAL"
                 ]
+                # 🔥 LIMITAR A 300 SÍMBOLOS
+                symbols = symbols[:300]
                 log.info(f"Símbolos USDT Perpetual activos en Binance Futures: {len(symbols)}")
                 return symbols
 
