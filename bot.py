@@ -64,7 +64,8 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8700613197:AAFu7KAP3_
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "1474510598")
 
 EXECUTOR_URL    = os.environ.get("EXECUTOR_URL",    "https://executor-5lu0.onrender.com")
-EXECUTOR_SECRET = os.environ.get("EXECUTOR_SECRET", "clave-secreta-aleatoria")
+# ⚠️  DEBE coincidir exactamente con SIGNAL_SECRET en futures_executor.py
+EXECUTOR_SECRET = os.environ.get("EXECUTOR_SECRET", "cambiar-por-secreto-seguro")
 
 # ── EMAs ─────────────────────────────────────────────────────────────────────
 EMA_FAST = int(os.environ.get("EMA_FAST",   "35"))
@@ -170,6 +171,8 @@ class TradeManager:
 
     # Umbral de drawdown global (en USDT) para cierre de emergencia
     GLOBAL_SL_USDT = 6.5
+    # Umbral de ganancia global (en USDT) para toma de beneficios global
+    GLOBAL_TP_USDT = 21.0
 
     def __init__(self) -> None:
         self.balance             = INITIAL_BALANCE
@@ -177,7 +180,8 @@ class TradeManager:
         self.trades              : list[Trade] = []
         self._counter            = 0
         self._lock               = asyncio.Lock()
-        self._global_sl_lock     = asyncio.Lock()    # Evita doble disparo del cierre global
+        self._global_sl_lock     = asyncio.Lock()    # Evita doble disparo del cierre global SL
+        self._global_tp_lock     = asyncio.Lock()    # Evita doble disparo del cierre global TP
 
     # ── Propiedades de consulta ───────────────────────────────────────────────
 
@@ -315,6 +319,30 @@ class TradeManager:
             )
         return closed
 
+    # ── Cierre global por TP (+21 USDT sobre balance de ciclo) ──────────────
+
+    async def close_all_trades_global_tp(self) -> list[Trade]:
+        """
+        Cierra TODAS las posiciones abiertas a precio actual (cierre global TP).
+        Se dispara cuando el equity supera cycle_start_balance + GLOBAL_TP_USDT.
+        Tras el cierre, resetea cycle_start_balance con el nuevo balance.
+        Retorna la lista de trades cerrados.
+        """
+        closed: list[Trade] = []
+        async with self._lock:
+            for trade in list(self.open_trades):
+                price = trade.current_price if trade.current_price > 0 else trade.entry_price
+                self._apply_close(trade, price, "GLOBAL_TP")
+                closed.append(trade)
+
+            # ── Inicio del nuevo ciclo ────────────────────────────────────────
+            self.cycle_start_balance = self.balance
+            log.info(
+                f"[GLOBAL TP] {len(closed)} posiciones cerradas | "
+                f"Nuevo balance de ciclo: {self.balance:.2f} USDT"
+            )
+        return closed
+
     # ── Drawdown actual vs inicio de ciclo ───────────────────────────────────
 
     @property
@@ -446,9 +474,25 @@ async def notify_executor(
             headers={"X-Signal-Secret": EXECUTOR_SECRET},
             timeout=aiohttp.ClientTimeout(total=8),
         ) as resp:
-            log.debug(f"Executor: {resp.status}")
+            if resp.status == 200:
+                log.info(
+                    f"Executor ✅ {payload.get('action','?').upper()} "
+                    f"{payload.get('symbol','?')} → HTTP {resp.status}"
+                )
+            elif resp.status == 401:
+                log.error(
+                    f"Executor ❌ 401 Unauthorized — verifica que EXECUTOR_SECRET "
+                    f"(bot) == SIGNAL_SECRET (executor). action={payload.get('action')}"
+                )
+            else:
+                body = await resp.text()
+                log.warning(
+                    f"Executor ⚠️ HTTP {resp.status} "
+                    f"action={payload.get('action')} symbol={payload.get('symbol')} "
+                    f"| {body[:120]}"
+                )
     except Exception as e:
-        log.warning(f"notify_executor: {e}")
+        log.warning(f"notify_executor [{payload.get('action')}]: {e}")
 
 
 def build_open_message(trade: Trade, ema_result: dict, change_1m: float) -> str:
@@ -536,7 +580,7 @@ def build_close_message(trade: Trade) -> str:
 
 
 def build_global_sl_message(closed_trades: list, prev_cycle_balance: float) -> str:
-    """Mensaje Telegram cuando se dispara el cierre global por drawdown -7 USDT."""
+    """Mensaje Telegram cuando se dispara el cierre global por drawdown -6.5 USDT."""
     total_pnl = sum(t.pnl_usdt for t in closed_trades)
     n         = len(closed_trades)
     new_bal   = trade_manager.balance
@@ -550,9 +594,10 @@ def build_global_sl_message(closed_trades: list, prev_cycle_balance: float) -> s
     suffix = f"\n  <i>…y {n - 15} más</i>" if n > 15 else ""
 
     return (
-        f"🚨 <b>CIERRE GLOBAL — DRAWDOWN -7 USDT</b>\n"
+        f"🚨 <b>CIERRE GLOBAL — DRAWDOWN -{TradeManager.GLOBAL_SL_USDT:.1f} USDT</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ El equity cayó más de <b>7 USDT</b> desde el inicio del ciclo.\n"
+        f"⚠️ El equity cayó más de <b>{TradeManager.GLOBAL_SL_USDT:.1f} USDT</b> "
+        f"desde el inicio del ciclo.\n"
         f"🔒 Se cerraron <b>{n} posiciones</b> al precio actual.\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💼 Balance inicio de ciclo: <code>{prev_cycle_balance:.2f} USDT</code>\n"
@@ -567,9 +612,40 @@ def build_global_sl_message(closed_trades: list, prev_cycle_balance: float) -> s
     )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  GESTIÓN DEL KLINEWEBSOCKETCACHE
-# ══════════════════════════════════════════════════════════════════════════════
+def build_global_tp_message(closed_trades: list, prev_cycle_balance: float) -> str:
+    """Mensaje Telegram cuando se dispara el cierre global por take profit +21 USDT."""
+    total_pnl = sum(t.pnl_usdt for t in closed_trades)
+    n         = len(closed_trades)
+    new_bal   = trade_manager.balance
+    profit    = new_bal - prev_cycle_balance
+
+    detail_lines = "\n".join(
+        f"  #{t.id} {t.symbol} {t.direction}: "
+        f"<code>{t.pnl_usdt:+.4f} USDT ({t.roi_pct:+.2f}%)</code>"
+        for t in closed_trades[:15]
+    )
+    suffix = f"\n  <i>…y {n - 15} más</i>" if n > 15 else ""
+
+    return (
+        f"🏆 <b>CIERRE GLOBAL — TAKE PROFIT +21 USDT</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ El equity superó <b>+{TradeManager.GLOBAL_TP_USDT:.0f} USDT</b> "
+        f"desde el inicio del ciclo.\n"
+        f"🔒 Se cerraron <b>{n} posiciones</b> al precio actual.\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💼 Balance inicio de ciclo: <code>{prev_cycle_balance:.2f} USDT</code>\n"
+        f"💼 Balance nuevo (ciclo):   <code>{new_bal:.2f} USDT</code>\n"
+        f"📈 Ganancia del ciclo:      <code>{profit:+.4f} USDT</code>\n"
+        f"📊 PnL total cerrado:       <code>{total_pnl:+.4f} USDT</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Operaciones cerradas:</b>\n"
+        f"{detail_lines}{suffix}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔄 <i>Nuevo ciclo iniciado. Balance base: {new_bal:.2f} USDT</i>"
+    )
+
+
+
 
 def init_cache(symbols: List[str]) -> KlineWebSocketCache:
     """
@@ -718,7 +794,7 @@ async def ws_price_loop(session: aiohttp.ClientSession) -> None:
                             if sym and price > 0:
                                 trade_manager.update_price(sym, price)
 
-                                # ── Check drawdown global (-7 USDT del ciclo) ──────
+                                # ── Check drawdown global (-6.5 USDT del ciclo) ──────
                                 if (
                                     trade_manager.open_trades
                                     and trade_manager.cycle_drawdown
@@ -742,6 +818,33 @@ async def ws_price_loop(session: aiohttp.ClientSession) -> None:
                                                 await send_telegram(
                                                     session,
                                                     build_global_sl_message(closed_trades, prev_bal)
+                                                )
+                                    continue   # Saltar check TP/SL individual (ya están cerrados)
+
+                                # ── Check profit global (+21 USDT del ciclo) ─────────
+                                if (
+                                    trade_manager.open_trades
+                                    and trade_manager.cycle_drawdown
+                                        >= TradeManager.GLOBAL_TP_USDT
+                                ):
+                                    async with trade_manager._global_tp_lock:
+                                        # Re-verificar dentro del lock para evitar doble disparo
+                                        if (
+                                            trade_manager.open_trades
+                                            and trade_manager.cycle_drawdown
+                                                >= TradeManager.GLOBAL_TP_USDT
+                                        ):
+                                            prev_bal = trade_manager.cycle_start_balance
+                                            log.info(
+                                                f"[GLOBAL TP] Equity: {trade_manager.equity:.2f} | "
+                                                f"Ciclo inicio: {prev_bal:.2f} | "
+                                                f"Profit: {trade_manager.cycle_drawdown:+.4f} USDT"
+                                            )
+                                            closed_trades = await trade_manager.close_all_trades_global_tp()
+                                            if closed_trades:
+                                                await send_telegram(
+                                                    session,
+                                                    build_global_tp_message(closed_trades, prev_bal)
                                                 )
                                     continue   # Saltar check TP/SL individual (ya están cerrados)
                                 # ── Check TP/SL individuales ────────────────────────
@@ -1097,6 +1200,7 @@ def get_dashboard_state() -> dict:
         "cycle_start_balance" : tm.cycle_start_balance,
         "cycle_drawdown"      : tm.cycle_drawdown,
         "global_sl_usdt"      : TradeManager.GLOBAL_SL_USDT,
+        "global_tp_usdt"      : TradeManager.GLOBAL_TP_USDT,
         "realized_pnl"        : tm.total_realized_pnl,
         "unrealized_pnl"      : tm.unrealized_pnl,
         "wins"                : wins,
@@ -1213,6 +1317,8 @@ def build_dashboard() -> str:
       <div class="value" id="cycle_dd_value" style="color:{dd_color}">{tm.cycle_drawdown:+.4f} USDT</div></div>
     <div class="card"><div class="label">🚨 Límite global SL</div>
       <div class="value err">-{TradeManager.GLOBAL_SL_USDT:.2f} USDT</div></div>
+    <div class="card"><div class="label">🏆 Objetivo global TP</div>
+      <div class="value ok">+{TradeManager.GLOBAL_TP_USDT:.2f} USDT</div></div>
   </div>
 
   <!-- KlineWebSocketCache stats -->
