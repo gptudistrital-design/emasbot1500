@@ -65,7 +65,7 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "1474510598")
 
 EXECUTOR_URL    = os.environ.get("EXECUTOR_URL",    "https://executor-5lu0.onrender.com")
 # ⚠️  DEBE coincidir exactamente con SIGNAL_SECRET en futures_executor.py
-EXECUTOR_SECRET = os.environ.get("EXECUTOR_SECRET", "cambiar-por-secreto-seguro")
+EXECUTOR_SECRET = os.environ.get("EXECUTOR_SECRET", "clave-secreta-aleatoria")
 
 # ── EMAs ─────────────────────────────────────────────────────────────────────
 EMA_FAST = int(os.environ.get("EMA_FAST",   "35"))
@@ -172,7 +172,7 @@ class TradeManager:
     # Umbral de drawdown global (en USDT) para cierre de emergencia
     GLOBAL_SL_USDT = 6.5
     # Umbral de ganancia global (en USDT) para toma de beneficios global
-    GLOBAL_TP_USDT = 21.0
+    GLOBAL_TP_USDT = 7.0
 
     def __init__(self) -> None:
         self.balance             = INITIAL_BALANCE
