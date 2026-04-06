@@ -1060,15 +1060,13 @@ async def run_scan(session: aiohttp.ClientSession, symbols: List[str]) -> None:
         trade = await trade_manager.open_trade(symbol, result["signal"], price)
 
         if trade:
-            asyncio.create_task(
-                notify_executor(session, {
-                    "action"   : "open",
-                    "trade_id" : trade.id,
-                    "symbol"   : trade.symbol,
+            await notify_executor(session, {
+                    "action": "open",
+                    "trade_id": trade.id,
+                    "symbol": trade.symbol,
                     "direction": trade.direction,
-                    "price"    : trade.entry_price,
+                    "price": trade.entry_price,
                 })
-            )
             msg = build_open_message(trade, result, change_1m)
             log.info(
                 f"  → {result['signal']} {symbol} | "
