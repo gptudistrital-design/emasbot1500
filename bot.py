@@ -1422,7 +1422,7 @@ async def start_http_server() -> None:
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     log.info(f"Dashboard activo en http://0.0.0.0:{PORT}")
-    app.router.add_get("/api/trades/download", download_trades_handler)
+    #app.router.add_get("/api/trades/download", download_trades_handler)
     
 # ── HANDLER DE DESCARGA CSV ──────────────────────────────────────────
 async def download_trades_handler(request: web.Request) -> web.Response:
