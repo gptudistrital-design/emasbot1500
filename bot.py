@@ -160,6 +160,10 @@ class Trade:
     close_time    : str   = ""
     pnl_usdt      : float = 0.0
     roi_pct       : float = 0.0
+    signal_mode       : str   = "normal"    # qué modo estaba activo al abrir
+    original_signal   : str   = ""          # señal EMA antes de invertir
+    effective_tp_pct  : float = TP_PCT      # % TP real aplicado
+    effective_sl_pct  : float = SL_PCT      # % SL real aplicado
 
 
 class TradeManager:
@@ -182,6 +186,13 @@ class TradeManager:
         self._lock               = asyncio.Lock()
         self._global_sl_lock     = asyncio.Lock()    # Evita doble disparo del cierre global SL
         self._global_tp_lock     = asyncio.Lock()    # Evita doble disparo del cierre global TP
+        MODE_NORMAL_TP   = 1.0   # TP modo normal
+        MODE_NORMAL_SL   = 4.0   # SL modo normal
+        MODE_INVERTED_TP = 4.0   # TP modo invertido
+        MODE_INVERTED_SL = 1.0   # SL modo invertido
+
+        self.signal_mode  = "normal"   # ciclo 1 siempre inicia normal
+        self.signal_cycle = 1
 
     # ── Propiedades de consulta ───────────────────────────────────────────────
 
@@ -225,6 +236,17 @@ class TradeManager:
         async with self._lock:
             if symbol in self.active_symbols:
                 return None
+            if self.signal_mode == "inverted":
+                effective_dir = "SHORT" if direction == "LONG" else "LONG"
+                tp_pct = 4.0  # TP grande
+                sl_pct = 1.0  # SL pequeño
+            else:
+                effective_dir = direction  # sin cambio
+                tp_pct = 1.0
+                sl_pct = 4.0
+                
+            direction=effective_dir
+                
             if direction == "LONG" and len(self.open_longs) >= MAX_LONGS:
                 return None
             if direction == "SHORT" and len(self.open_shorts) >= MAX_SHORTS:
@@ -233,11 +255,11 @@ class TradeManager:
                 return None
 
             if direction == "LONG":
-                tp_price = price * (1 + TP_PCT / 100)
-                sl_price = price * (1 - SL_PCT / 100)
+                tp_price = price * (1 + tp_pct / 100)
+                sl_price = price * (1 - sl_pct / 100)
             else:
-                tp_price = price * (1 - TP_PCT / 100)
-                sl_price = price * (1 + SL_PCT / 100)
+                tp_price = price * (1 - tp_pct / 100)
+                sl_price = price * (1 + sl_pct / 100)
 
             self._counter += 1
             trade = Trade(
@@ -313,6 +335,8 @@ class TradeManager:
 
             # ── Inicio del nuevo ciclo ────────────────────────────────────────
             self.cycle_start_balance = self.balance
+            self.signal_mode = "inverted" if self.signal_mode == "normal" else "normal"
+            self.signal_cycle += 1
             log.warning(
                 f"[GLOBAL SL] {len(closed)} posiciones cerradas | "
                 f"Nuevo balance de ciclo: {self.balance:.2f} USDT"
@@ -337,6 +361,8 @@ class TradeManager:
 
             # ── Inicio del nuevo ciclo ────────────────────────────────────────
             self.cycle_start_balance = self.balance
+            self.signal_mode = "inverted" if self.signal_mode == "normal" else "normal"
+            self.signal_cycle += 1
             log.info(
                 f"[GLOBAL TP] {len(closed)} posiciones cerradas | "
                 f"Nuevo balance de ciclo: {self.balance:.2f} USDT"
@@ -643,8 +669,6 @@ def build_global_tp_message(closed_trades: list, prev_cycle_balance: float) -> s
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔄 <i>Nuevo ciclo iniciado. Balance base: {new_bal:.2f} USDT</i>"
     )
-
-
 
 
 def init_cache(symbols: List[str]) -> KlineWebSocketCache:
@@ -1050,6 +1074,8 @@ async def run_scan(session: aiohttp.ClientSession, symbols: List[str]) -> None:
                 f"  → {result['signal']} {symbol} | "
                 f"spread {result['spread']:.2f}% | Trade #{trade.id}"
             )
+            
+            
         else:
             msg = build_signal_no_trade_message(symbol, result, price)
             log.info(
@@ -1398,7 +1424,38 @@ async def start_http_server() -> None:
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     log.info(f"Dashboard activo en http://0.0.0.0:{PORT}")
-
+    app.router.add_get("/api/trades/download", download_trades_handler)
+    
+# ── HANDLER DE DESCARGA CSV ──────────────────────────────────────────
+async def download_trades_handler(request: web.Request) -> web.Response:
+    """Descarga TODAS las operaciones (abiertas + cerradas) como CSV."""
+    import csv, io
+    tm = trade_manager
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "id","symbol","direction","signal_mode","original_signal",
+        "entry_price","close_price","quantity","usdt_size",
+        "tp_price","sl_price","effective_tp_pct","effective_sl_pct",
+        "status","pnl_usdt","roi_pct","open_time","close_time"
+    ])
+    for t in sorted(tm.trades, key=lambda x: x.id):
+        writer.writerow([
+            t.id, t.symbol, t.direction, t.signal_mode, t.original_signal,
+            f"{t.entry_price:.8f}", f"{t.close_price:.8f}",
+            f"{t.quantity:.6f}", f"{t.usdt_size:.2f}",
+            f"{t.tp_price:.8f}", f"{t.sl_price:.8f}",
+            t.effective_tp_pct, t.effective_sl_pct,
+            t.status, f"{t.pnl_usdt:.4f}", f"{t.roi_pct:.2f}",
+            t.open_time, t.close_time,
+        ])
+    csv_bytes = output.getvalue().encode("utf-8")
+    filename  = f"trades_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
+    return web.Response(
+        body=csv_bytes,
+        content_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  BOT LOOP PRINCIPAL
